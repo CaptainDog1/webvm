@@ -18,7 +18,9 @@
 
 	var term = null;
 	var cx = null;
+	var fitAddon = null;
 	var cxReadFunc = null;
+	var blockCache = null;
 	var processCount = 0;
 	var curVT = 0;
 	function writeData(buf, vt)
@@ -81,7 +83,7 @@
 				eTime = limitTime;
 			if(e.state == "ready")
 			{
-				// Inactive state, add the time frome lastActiveTime
+				// Inactive state, add the time from lastActiveTime
 				totalActiveTime += (eTime - lastActiveTime);
 				lastWasActive = false;
 			}
@@ -128,13 +130,45 @@
 			clearInterval(activityEventsInterval);
 		activityEventsInterval = setInterval(cleanupEvents, 2000);
 	}
+	function computeXTermFontSize()
+	{
+		return parseInt(getComputedStyle(document.body).fontSize);
+	}
+	function setScreenSize(display)
+	{
+		var mult = 1.0;
+		var displayWidth = display.offsetWidth;
+		var displayHeight = display.offsetHeight;
+		var minWidth = 1024;
+		var minHeight = 768;
+		if(displayWidth < minWidth)
+			mult = minWidth / displayWidth;
+		if(displayHeight < minHeight)
+			mult = Math.max(mult, minHeight / displayHeight);
+		cx.setKmsCanvas(display, displayWidth * mult, displayHeight * mult);
+	}
+	var curInnerWidth = 0;
+	var curInnerHeight = 0;
+	function handleResize()
+	{
+		// Avoid spurious resize events caused by the soft keyboard
+		if(curInnerWidth == window.innerWidth && curInnerHeight == window.innerHeight)
+			return;
+		curInnerWidth = window.innerWidth;
+		curInnerHeight = window.innerHeight;
+		term.options.fontSize = computeXTermFontSize();
+		fitAddon.fit();
+		const display = document.getElementById("display");
+		if(display)
+			setScreenSize(display);
+	}
 	async function initTerminal()
 	{
 		const { Terminal } = await import('@xterm/xterm');
 		const { FitAddon } = await import('@xterm/addon-fit');
 		const { WebLinksAddon } = await import('@xterm/addon-web-links');
-		term = new Terminal({cursorBlink:true, convertEol:true, fontFamily:"monospace", fontWeight: 400, fontWeightBold: 700});
-		var fitAddon = new FitAddon();
+		term = new Terminal({cursorBlink:true, convertEol:true, fontFamily:"monospace", fontWeight: 400, fontWeightBold: 700, fontSize: computeXTermFontSize()});
+		fitAddon = new FitAddon();
 		term.loadAddon(fitAddon);
 		var linkAddon = new WebLinksAddon();
 		term.loadAddon(linkAddon);
@@ -142,7 +176,7 @@
 		term.open(consoleDiv);
 		term.scrollToTop();
 		fitAddon.fit();
-		window.addEventListener("resize", function(ev){ fitAddon.fit(); });
+		window.addEventListener("resize", handleResize);
 		term.focus();
 		term.onData(readData);
 		// Avoid undesired default DnD handling
@@ -154,6 +188,8 @@
 		consoleDiv.addEventListener("dragenter", preventDefaults, false);
 		consoleDiv.addEventListener("dragleave", preventDefaults, false);
 		consoleDiv.addEventListener("drop", preventDefaults, false);
+		curInnerWidth = window.innerWidth;
+		curInnerHeight = window.innerHeight;
 		if(configObj.printIntro)
 			printMessage(introMessage);
 		try
@@ -176,7 +212,7 @@
 			return;
 		// Raise the display to the foreground
 		const display = document.getElementById("display");
-		display.style.zIndex = 5;
+		display.parentElement.style.zIndex = 5;
 		plausible("Display activated");
 	}
 	function handleProcessCreated()
@@ -222,8 +258,10 @@
 			default:
 				throw new Error("Unrecognized device type");
 		}
-		var overlayDevice = await CheerpX.OverlayDevice.create(blockDevice, await CheerpX.IDBDevice.create(cacheId));
+		blockCache = await CheerpX.IDBDevice.create(cacheId);
+		var overlayDevice = await CheerpX.OverlayDevice.create(blockDevice, blockCache);
 		var webDevice = await CheerpX.WebDevice.create("");
+		var documentsDevice = await CheerpX.WebDevice.create("documents");
 		var dataDevice = await CheerpX.DataDevice.create();
 		var mountPoints = [
 			// The root filesystem, as an Ext2 image
@@ -234,8 +272,14 @@
 			{type:"dir", dev:dataDevice, path:"/data"},
 			// Automatically created device files
 			{type:"devs", path:"/dev"},
+			// Pseudo-terminals
+			{type:"devpts", path:"/dev/pts"},
 			// The Linux 'proc' filesystem which provides information about running processes
-			{type:"proc", path:"/proc"}
+			{type:"proc", path:"/proc"},
+			// The Linux 'sysfs' filesystem which is used to enumerate emulated devices
+			{type:"sys", path:"/sys"},
+			// Convenient access to sample documents in the user directory
+			{type:"dir", dev:documentsDevice, path:"/home/user/documents"}
 		];
 		try
 		{
@@ -256,7 +300,7 @@
 		const display = document.getElementById("display");
 		if(display)
 		{
-			cx.setKmsCanvas(display, 1024, 768);
+			setScreenSize(display);
 			cx.setActivateConsole(handleActivateConsole);
 		}
 		// Run the command in a loop, in case the user exits
@@ -272,14 +316,67 @@
 		await cx.networkLogin();
 		w.location.href = await startLogin();
 	}
+	async function handleReset()
+	{
+		// Be robust before initialization
+		if(blockCache == null)
+			return;
+		await blockCache.reset();
+		location.reload();
+	}
+	async function handleTool(tool)
+	{
+		if(tool.command)
+		{
+			var sentinel = "# End of AI command";
+			var buffer = term.buffer.active;
+			// Get the current cursor position
+			var marker = term.registerMarker();
+			var startLine = marker.line;
+			marker.dispose();
+			var ret = new Promise(function(f, r)
+			{
+				var callbackDisposer = term.onWriteParsed(function()
+				{
+					var curLength = buffer.length;
+					// Accumulate the output and see if the sentinel has been printed
+					var output = "";
+					for(var i=startLine + 1;i<curLength;i++)
+					{
+						var curLine = buffer.getLine(i).translateToString(true, 0, term.cols);;
+						if(curLine.indexOf(sentinel) >= 0)
+						{
+							// We are done, cleanup and return
+							callbackDisposer.dispose();
+							return f(output);
+						}
+						output += curLine + "\n";
+					}
+				});
+			});
+			term.input(tool.command);
+			term.input("\n");
+			term.input(sentinel);
+			term.input("\n");
+			return ret;
+		}
+		else
+		{
+			debugger;
+		}
+	}
 </script>
 
 <main class="relative w-full h-full">
 	<Nav />
 	<div class="absolute top-10 bottom-0 left-0 right-0">
-		<SideBar on:connect={handleConnect}/>
+		<SideBar on:connect={handleConnect} on:reset={handleReset} needsDisplay={configObj.needsDisplay} handleTool={handleTool}>
+			<slot></slot>
+		</SideBar>
 		{#if configObj.needsDisplay}
-			<canvas class="absolute top-0 bottom-0 left-14 right-0" width="1024" height="768" id="display"></canvas>
+			<div class="absolute top-0 bottom-0 left-14 right-0">
+				<canvas class="w-full h-full cursor-none" id="display"></canvas>
+			</div>
 		{/if}
 		<div class="absolute top-0 bottom-0 left-14 right-0 p-1 scrollbar" id="console">
 		</div>
